@@ -1,11 +1,21 @@
 import sys
+from pathlib import Path
 import yt_dlp
 
 
 def download_audio(url):
+    # Directory containing this Python script
+    script_dir = Path(__file__).resolve().parent
+
+    # Create ./unprocessed next to the script
+    output_dir = script_dir / "unprocessed"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     options = {
         "format": "bestaudio/best",
-        "outtmpl": "%(title)s.%(ext)s",
+
+        # Save downloaded/converted file in ./unprocessed/
+        "outtmpl": str(output_dir / "%(title)s.%(ext)s"),
 
         "postprocessors": [
             {
@@ -16,7 +26,8 @@ def download_audio(url):
         ],
     }
 
-    print(f"\nDownloading:\n{url}\n")
+    print(f"\nDownloading:\n{url}")
+    print(f"Output directory: {output_dir}\n")
 
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
@@ -25,11 +36,11 @@ def download_audio(url):
 
 
 def main():
-    # If URL was supplied from the command line
+    # URL supplied through CLI
     if len(sys.argv) > 1:
         url = sys.argv[1]
 
-    # Otherwise ask for it
+    # Otherwise prompt for URL
     else:
         url = input("Paste YouTube URL: ").strip()
 
