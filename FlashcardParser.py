@@ -147,7 +147,7 @@ class FlashcardParser:
 
     def parse_meanings(self, meanings_section, images):
         positions = list(re.finditer(
-            r"^''([^']+)''\s*$",
+            r"^''([^'\n]+)''[^\n]*$",
             meanings_section,
             re.MULTILINE,
         ))
@@ -191,10 +191,9 @@ class FlashcardParser:
                 })
 
             if definitions:
-                part_of_speech = pos_text.split(
-                    ",",
-                    1
-                )[0].strip()
+                # Preserve the full Wikisłownik grammatical heading, e.g.
+                # "rzeczownik, rodzaj nijaki", instead of truncating at the comma.
+                part_of_speech = pos_text
 
                 results.append({
                     "part_of_speech": part_of_speech,
