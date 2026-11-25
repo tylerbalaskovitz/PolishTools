@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Offline Polish sentence + explanation generator using Ollama (Gemma 3 12B).
+
+Requires a running Ollama service and a downloaded model:
+    ollama pull gemma3:12b
+
+No third-party Python packages required.
+"""
+import argparse
+import json
+import re
+import sqlite3
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_DB = Path(__file__).resolve().parent / 'data' / 'polish_contexts.db'
+DEFAULT_URL = 'http://127.0.0.1:11434/api/chat'
+
+
+def generate(word, definition='', model='gemma3:12b', url=DEFAULT_URL):
+    instructions = (
+        'Jesteś starannym nauczycielem języka polskiego. '
+        'Tworzysz naturalne, krótkie zdania dla osoby uczącej się języka polskiego. '
+        'Używaj słownictwa A1–A2, jeśli to możliwe. '
+        'Słowo docelowe może być trudniejsze niż A2. '
+        'W zdaniu użyj dokładnie podanego słowa, jeśli pasuje gramatycznie; '
+        'w przeciwnym razie użyj jego poprawnej formy fleksyjnej. '
+        'Nie wymyślaj znaczenia słowa. Jeśli podano definicję, trzymaj się jej. '
+        'Wyjaśnienie powinno prostymi słowami objaśniać znaczenie zdania, '
+        'bez powtarzania trudnego słowa, o ile to możliwe. '
+        'Zwróć WYŁĄCZNIE obiekt JSON z dwoma polami tekstowymi: '
+        '"zdanie" oraz "wyjasnienie". Bez markdownu i dodatkowego tekstu.'
+    )
+    content = f'Słowo: {word}\n'
+    if definition:
+        content += f'Definicja: {definition}\n'
+    content += 'Utwórz jedno zdanie i jedno proste wyjaśnienie.'
+    payload = {
+        'model': model,
+        'stream': False,
+        'format': 'json',
+        'options': {'temperature': 0.35, 'num_predict': 220, 'num_ctx': 2048},
+        'messages': [
+            {'role': 'system', 'content': instructions},
+            {'role': 'user', 'content': content},
+        ],
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    with urllib.request.urlopen(request, timeout=180) as response:
+        result = json.load(response)
+    raw = result.get('message', {}).get('content', '').strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'Model did not return valid JSON: {raw[:300]}') from exc
+    sentence = str(parsed.get('zdanie', '')).strip()
+    explanation = str(parsed.get('wyjasnienie', '')).strip()
+    if not sentence or not explanation:
+        raise ValueError(f'Model returned incomplete output: {raw[:300]}')
+    return sentence, explanation
+
+
+
+def lookup_wikislownik(word):
+    """Fetch Polish senses using the same Wikislownik and FlashcardParser as FlashcardMaker."""
+    from FlashcardUtils import Wikislownik
+    from FlashcardParser import FlashcardParser
+
+    wiki = Wikislownik()  # Respect WM_CONTACT; surface errors instead of claiming no entry.
+    page = wiki.get_page(word)
+    if page is None:
+        return [], 'missing'
+    result = FlashcardParser().parse(word, page['wikitext'])
+    if not result:
+        return [], 'unparsed'
+    choices = []
+    for meaning in result.get('meanings', []):
+        for item in meaning.get('definitions', []):
+            definition = (item.get('definition') or '').strip()
+            if definition:
+                choices.append((meaning.get('part_of_speech', ''), item.get('sense', ''), definition))
+    return choices, 'ok' if choices else 'unparsed'
+
+
+def normalized_headwords(word):
+    """Use the normalizer's participle rule as well as Morfeusz analyses."""
+    try:
+        from PolishNormalizer import PolishNormalizer
+        analyses = PolishNormalizer().candidates(word)
+    except (ImportError, RuntimeError, ValueError) as exc:
+        print(f'Normalizacja niedostępna: {exc}')
+        return []
+    result = []
+    seen = set()
+    for analysis in analyses:
+        lemma = analysis.get('lemma', '').strip()
+        if lemma and lemma.casefold() not in seen:
+            result.append((lemma, analysis.get('tag', '')))
+            seen.add(lemma.casefold())
+
+    # Same original-form alternative as PolishNormalizer.resolve().
+    # It is a deliberate choice even when the exact Wikisłownik page is absent.
+    if (word.casefold().endswith(('ony', 'any', 'ęty', 'ity', 'yty'))
+            and word.casefold() not in seen):
+        result.append((word, 'adjective/participle (original form)'))
+    return result
+
+
+def propose_definition(word, selected_form, model='gemma3:12b', url=DEFAULT_URL):
+    """Ask local Gemma for a short definition; never treat it as verified."""
+    instructions = (
+        'Jesteś pomocnikiem językowym. Zaproponuj krótką, prostą definicję po polsku '
+        'na poziomie A1–A2, najwyżej 12 słów. '
+        'Słowo może być rzadkie. Jeśli nie znasz jego znaczenia, '
+        'zwróć pusty tekst w polu definicja. '
+        'Nie wymyślaj znaczenia. '
+        'Jeżeli forma słownikowa jest czasownikiem, objaśnij znaczenie '
+        'ORYGINALNEGO słowa, uwzględniając jego formę gramatyczną. '
+        'Zwróć tylko JSON: {"definicja": "..."}.'
+    )
+    payload = {
+        'model': model, 'stream': False, 'format': 'json',
+        'options': {'temperature': 0.15, 'num_predict': 100, 'num_ctx': 2048},
+        'messages': [
+            {'role': 'system', 'content': instructions},
+            {'role': 'user', 'content': f'Słowo oryginalne: {word}\nWybrana forma słownikowa: {selected_form}\nPodaj znaczenie słowa oryginalnego.'},
+        ],
+    }
+    request = urllib.request.Request(
+        url, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers={'Content-Type': 'application/json'}, method='POST')
+    with urllib.request.urlopen(request, timeout=180) as response:
+        raw = json.load(response).get('message', {}).get('content', '').strip()
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        raise ValueError('Gemma returned an unexpected definition format')
+    return str(result.get('definicja') or '').strip()
+
+
+def approve_definition(word, selected_form, model, url):
+    """Show an explicitly unverified suggestion and require approval."""
+    while True:
+        try:
+            proposed = propose_definition(word, selected_form, model, url)
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            print(f'Nie udało się wygenerować definicji: {exc}')
+            proposed = ''
+        if proposed:
+            print(f'\nProponowana definicja (Gemma — NIEZWERYFIKOWANA):\n{proposed}')
+            choice = input('[a] zaakceptuj / [e] edytuj / [r] ponów / [p] pomiń: ').strip().lower()
+            if choice == 'a':
+                return proposed
+            if choice == 'r':
+                continue
+            if choice == 'e':
+                return input('Definicja: ').strip()
+            if choice == 'p':
+                return ''
+        else:
+            print('Gemma nie zaproponowała definicji.')
+            choice = input('[e] własna definicja / [r] ponów / [p] pomiń: ').strip().lower()
+            if choice == 'r':
+                continue
+            if choice == 'e':
+                return input('Definicja: ').strip()
+            return ''
+
+
+def choose_definition(word, manual_definition='', no_wiki=False, model='gemma3:12b', url=DEFAULT_URL):
+    """Look up the original, offer morphological alternatives, then approved AI fallback."""
+    if manual_definition:
+        return manual_definition
+    if no_wiki:
+        return ''
+
+    def lookup(target):
+        try:
+            choices, status = lookup_wikislownik(target)
+        except Exception as exc:
+            print(f'Błąd podczas pobierania definicji: {exc}')
+            print('Sprawdź połączenie i WM_CONTACT; to nie oznacza braku hasła.')
+            return [], 'error'
+        if status == 'missing':
+            print(f'Brak osobnej strony hasła „{target}” w Wikisłowniku.')
+        elif status == 'unparsed':
+            print(f'Nie udało się odczytać polskich znaczeń dla „{target}”.')
+        return choices, status
+
+    choices, status = lookup(word)
+    if choices:
+        return select_sense(word, choices)
+
+    selected_form = word
+    if status in ('missing', 'unparsed'):
+        alternatives = normalized_headwords(word)
+        if alternatives:
+            print('\nMożliwe formy słownikowe (Morfeusz):')
+            for i, (lemma, tag) in enumerate(alternatives, 1):
+                print(f'  {i}. {lemma} ({tag})')
+            while True:
+                answer = input('Wybierz numer formy [1] / [h] inne hasło / [d] definicja / [p] pomiń: ').strip().lower()
+                if answer == 'd':
+                    return input('Definicja: ').strip()
+                if answer == 'p':
+                    return ''
+                if answer == 'h':
+                    selected_form = input('Hasło słownikowe: ').strip() or word
+                    break
+                if answer == '' or (answer.isdecimal() and 1 <= int(answer) <= len(alternatives)):
+                    selected_form = alternatives[int(answer or '1') - 1][0]
+                    break
+                print('Wybierz numer z listy.')
+        else:
+            answer = input('[h] inne hasło / [d] własna definicja / Enter = propozycja Gemmy: ').strip().lower()
+            if answer == 'd':
+                return input('Definicja: ').strip()
+            if answer == 'h':
+                selected_form = input('Hasło słownikowe: ').strip() or word
+
+        # Avoid retrying the same missing original page; do not cycle between lemmas.
+        if selected_form.casefold() != word.casefold():
+            choices, status = lookup(selected_form)
+            if choices:
+                return select_sense(selected_form, choices)
+
+    if status == 'error':
+        print('Nie udało się sprawdzić Wikisłownika. Definicja Gemmy będzie niezweryfikowana.')
+    return approve_definition(word, selected_form, model, url)
+
+
+def select_sense(headword, choices):
+    print(f'\nDefinicje z Wikisłownika ({headword}):')
+    for i, (pos, sense, definition) in enumerate(choices, 1):
+        print(f'  {i}. ({sense}) [{pos}] {definition}')
+    while True:
+        selected = input('Numer znaczenia [1], m = własna definicja, 0 = bez definicji: ').strip().lower()
+        if selected in ('', '1'):
+            return choices[0][2]
+        if selected == '0':
+            return ''
+        if selected == 'm':
+            return input('Definicja: ').strip()
+        if selected.isdecimal() and 1 <= int(selected) <= len(choices):
+            return choices[int(selected) - 1][2]
+        print('Wybierz numer z listy.')
+
+
+def init_db(db_path):
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute('''CREATE TABLE IF NOT EXISTS contexts (
+        word TEXT NOT NULL,
+        definition TEXT NOT NULL DEFAULT '',
+        sentence TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        model TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (word, definition)
+    )''')
+    conn.commit()
+    return conn
+
+
+def read_saved(conn, word, definition):
+    return conn.execute(
+        'SELECT sentence, explanation FROM contexts WHERE word=? AND definition=?',
+        (word, definition),
+    ).fetchone()
+
+
+def save(conn, word, definition, sentence, explanation, model):
+    conn.execute('''INSERT INTO contexts
+        (word, definition, sentence, explanation, model, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(word, definition) DO UPDATE SET
+            sentence=excluded.sentence,
+            explanation=excluded.explanation,
+            model=excluded.model,
+            updated_at=excluded.updated_at''',
+        (word, definition, sentence, explanation, model,
+         datetime.now(timezone.utc).isoformat(timespec='seconds')))
+    conn.commit()
+
+
+def process(conn, word, definition, args):
+    if not args.regenerate:
+        cached = read_saved(conn, word, definition)
+        if cached:
+            print('\n[Zapisany kontekst]')
+            print(f'Zdanie: {cached[0]}\nWyjaśnienie: {cached[1]}')
+            return
+    while True:
+        try:
+            sentence, explanation = generate(word, definition, args.model, args.url)
+        except urllib.error.URLError as exc:
+            print(f'Cannot connect to Ollama: {exc}\nStart it with: sudo systemctl start ollama', file=sys.stderr)
+            return
+        except (ValueError, TimeoutError) as exc:
+            print(f'Generation failed: {exc}', file=sys.stderr)
+            return
+        print(f'\nSłowo: {word}')
+        print(f'Zdanie: {sentence}')
+        print(f'Wyjaśnienie: {explanation}')
+        if args.yes:
+            choice = 's'
+        else:
+            choice = input('\n[s] zapisz / [r] ponów / [p] pomiń: ').strip().lower()
+        if choice in ('s', 'save', 'y', 'yes'):
+            save(conn, word, definition, sentence, explanation, args.model)
+            print('Zapisano.')
+            return
+        if choice in ('r', 'retry'):
+            continue
+        print('Pominięto.')
+        return
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate simple Polish context offline using Ollama')
+    parser.add_argument('word', nargs='?', help='Polish word (omit for interactive mode)')
+    parser.add_argument('--definition', '-d', default='', help='Polish definition, e.g. from Wikisłownik')
+    parser.add_argument('--model', default='gemma3:12b')
+    parser.add_argument('--no-wiki', action='store_true', help='Skip Wikisłownik lookup')
+    parser.add_argument('--db', type=Path, default=DEFAULT_DB)
+    parser.add_argument('--url', default=DEFAULT_URL, help='Local Ollama chat API URL')
+    parser.add_argument('--regenerate', action='store_true', help='Generate again even if saved')
+    parser.add_argument('--yes', '-y', action='store_true', help='Save without asking (review first is recommended)')
+    args = parser.parse_args()
+    conn = init_db(args.db)
+    try:
+        if args.word:
+            word = args.word.strip()
+            definition = choose_definition(word, args.definition.strip(), args.no_wiki, args.model, args.url)
+            process(conn, word, definition, args)
+        else:
+            print('Polish Context Creator — wpisz q, aby zakończyć.')
+            while True:
+                try:
+                    word = input('\nSłowo: ').strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if word.lower() in ('q', 'quit', 'exit'):
+                    break
+                if not word:
+                    continue
+                definition = choose_definition(word, args.definition.strip(), args.no_wiki, args.model, args.url)
+                process(conn, word, definition, args)
+    finally:
+        conn.close()
+
+
+if __name__ == '__main__':
+    main()

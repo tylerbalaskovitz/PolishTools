@@ -158,6 +158,21 @@ class PolishNormalizer:
                 f"No dictionary analysis found for '{target_word}'."
             )
 
+        # Morfeusz sometimes returns only the underlying verb for an
+        # adjectival participle. Offer the written form independently of
+        # Morfeusz so it can be looked up directly in Wikisłownik.
+        participial_ending = target_word.casefold().endswith(
+            ('ony', 'any', 'ęty', 'ity', 'yty')
+        )
+        if participial_ending and target_word.casefold() not in {
+            lemma.casefold() for lemma in lemma_options
+        }:
+            lemma_options[target_word] = [{
+                'lemma': target_word,
+                'part_of_speech': 'adjective/participle (original form)',
+                'tag': 'original-form',
+            }]
+
         lemmas = list(lemma_options)
 
         # Automatically resolve unambiguous words.

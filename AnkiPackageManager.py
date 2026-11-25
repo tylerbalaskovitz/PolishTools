@@ -2,6 +2,7 @@
 import hashlib
 import html
 import os
+import re
 import shutil
 import sqlite3
 from datetime import datetime, date
@@ -70,6 +71,7 @@ class AnkiPackageManager:
             directory.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(DATA / 'flashcards.db')
         self._ensure_cards_schema()
+        self._ensure_sentence_schema()
         self.db.execute('''CREATE TABLE IF NOT EXISTS lookup_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT, original TEXT NOT NULL,
             lemma TEXT NOT NULL, sense TEXT, looked_up_at TEXT NOT NULL)''')
@@ -111,6 +113,52 @@ class AnkiPackageManager:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (*row, old_guid))
             self.db.execute('DROP TABLE cards')
             self.db.execute('ALTER TABLE cards_v2 RENAME TO cards')
+
+    def _ensure_sentence_schema(self):
+        self.db.execute('''CREATE TABLE IF NOT EXISTS sentence_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original TEXT NOT NULL, lemma TEXT NOT NULL, sense TEXT NOT NULL,
+            definition TEXT NOT NULL, context TEXT NOT NULL,
+            context_key TEXT NOT NULL, grammar TEXT, image TEXT,
+            created_date TEXT NOT NULL, guid TEXT NOT NULL UNIQUE,
+            UNIQUE(lemma, sense, context_key))''')
+        self.db.commit()
+
+    @staticmethod
+    def _context_key(context):
+        return re.sub(r"\s+", " ", context).strip().casefold()
+
+    def has_sentence_card(self, lemma, sense, context):
+        key = self._context_key(context)
+        if not key:
+            return False
+        return self.db.execute('''SELECT 1 FROM sentence_cards
+            WHERE lemma=? AND sense=? AND context_key=?''',
+            (lemma.strip(), str(sense), key)).fetchone() is not None
+
+    def add_sentence_card(self, original, lemma, definition, sense='1.1',
+                          context='', grammar='', image_path=None):
+        context = re.sub(r"\s+", " ", context).strip()
+        if not context:
+            return False
+        lemma, sense = lemma.strip(), str(sense)
+        key = self._context_key(context)
+        if self.has_sentence_card(lemma, sense, context):
+            print(f'Already saved sentence: {context}')
+            return False
+        image = self.store_media(image_path) if image_path else None
+        guid = genanki.guid_for('wikislownik', 'sentence-v1', lemma, sense, key)
+        with self.db:
+            cursor = self.db.execute('''INSERT OR IGNORE INTO sentence_cards
+                (original, lemma, sense, definition, context, context_key,
+                 grammar, image, created_date, guid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (original.strip(), lemma, sense, definition.strip(), context,
+                 key, grammar.strip(), image, self.today(), guid))
+        if cursor.rowcount:
+            print(f'Added sentence: {context}')
+            return True
+        return False
 
     @staticmethod
     def today():
@@ -164,7 +212,10 @@ class AnkiPackageManager:
         date.fromisoformat(day)  # Validate before constructing output filename.
         rows = self.db.execute('''SELECT original, lemma, sense, definition, context, audio, image, guid, grammar
             FROM cards WHERE created_date=? ORDER BY id''', (day,)).fetchall()
-        if not rows:
+        sentences = self.db.execute('''SELECT original, lemma, sense, definition,
+            context, image, guid, grammar FROM sentence_cards
+            WHERE created_date=? ORDER BY id''', (day,)).fetchall()
+        if not rows and not sentences:
             print(f'No cards for {day}')
             return None
         deck = genanki.Deck(DECK_ID, 'Polish::Wikisłownik Vocabulary')
@@ -190,6 +241,19 @@ class AnkiPackageManager:
                                         html.escape(definition), audio_field, image_field,
                                         html.escape(context or '')])
             deck.add_note(note)
+        for original, lemma, sense, definition, context, image, guid, grammar in sentences:
+            image_field = ''
+            if image:
+                path = MEDIA / image
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+                media_paths.add(str(path))
+                image_field = f'<img src="{html.escape(image, quote=True)}">'
+            note = genanki.Note(model=MODEL, guid=guid,
+                                fields=[html.escape(context), html.escape(lemma),
+                                        html.escape(grammar or ''), html.escape(definition),
+                                        '', image_field, html.escape(original)])
+            deck.add_note(note)
         output = OUTPUT / f'PolishVocabulary_{day}.apkg'
         temporary = OUTPUT / f'.PolishVocabulary_{day}.apkg.tmp'
         package = genanki.Package(deck)
@@ -199,7 +263,7 @@ class AnkiPackageManager:
             os.replace(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)
-        print(f'Package: {output} | Cards: {len(rows)} | Media: {len(media_paths)}')
+        print(f'Package: {output} | Cards: {len(rows) + len(sentences)} | Media: {len(media_paths)}')
         return output
 
     def repair_audio(self):
@@ -299,8 +363,9 @@ class AnkiPackageManager:
         day = day or self.today()
         date.fromisoformat(day)
         cards = self.db.execute('SELECT COUNT(*) FROM cards WHERE created_date=?', (day,)).fetchone()[0]
+        sentence_cards = self.db.execute('SELECT COUNT(*) FROM sentence_cards WHERE created_date=?', (day,)).fetchone()[0]
         lookups = self.db.execute('SELECT COUNT(*) FROM lookup_history WHERE substr(looked_up_at,1,10)=?', (day,)).fetchone()[0]
-        return {'date': day, 'cards': cards, 'lookups': lookups}
+        return {'date': day, 'cards': cards, 'sentence_cards': sentence_cards, 'lookups': lookups}
 
     def close(self):
         self.db.close()

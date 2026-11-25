@@ -106,6 +106,12 @@ def process_entry(text, target=None, no_media=False, wiki=None, wikparser=None):
                 sense=selected['sense'], context='', grammar=grammar,
                 audio_path=audio_path, image_path=image_path,
             )
+        if context:
+            changed |= manager.add_sentence_card(
+                original=original, lemma=lemma, definition=selected['definition'],
+                sense=selected['sense'], context=context, grammar=grammar,
+                image_path=image_path,
+            )
         if changed:
             manager.build_daily_package()
 
